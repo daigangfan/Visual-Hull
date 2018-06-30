@@ -10,7 +10,7 @@
 #include <opencv2/opencv.hpp>
 #include <Eigen/Eigen>
 #include <limits>
-
+#include "octree.cpp"
 // 用于判断投影是否在visual hull内部
 struct Projection
 {
@@ -46,7 +46,7 @@ struct CoordinateInfo
 	{
 		return m_min + index * (m_max - m_min) / m_resolution;
 	}
-
+	
 	CoordinateInfo(int resolution = 10, double min = 0.0, double max = 100.0)
 		: m_resolution(resolution)
 		, m_min(min)
@@ -60,7 +60,8 @@ class Model
 public:
 	typedef std::vector<std::vector<bool>> Pixel;
 	typedef std::vector<Pixel> Voxel;
-
+	typedef std::vector<Eigen::Vector3i> PointSequenceInd;//用下标表示的顶点序列
+	
 	Model(int resX = 100, int resY = 100, int resZ = 100);
 	~Model();
 
@@ -70,21 +71,31 @@ public:
 	void loadImage(const char* pDir, const char* pPrefix, const char* pSuffix);
 	void getModel();
 	void getSurface();
+	void getModelUsingOctree();
+	
+	void updateNode(Node * node);
+	void updateTree(Node *node);
 	Eigen::Vector3f getNormal(int indX, int indY, int indZ);
-
+	Status searchPoint(int xind, int yind, int zind, Node* node);
 private:
 	CoordinateInfo m_corrX;
 	CoordinateInfo m_corrY;
 	CoordinateInfo m_corrZ;
-
+	octree* Octree;
 	int m_neiborSize;
-
+	Eigen::Vector3f indexVecToCorrVec(Eigen::Vector3i& indexVec);
 	std::vector<Projection> m_projectionList;
 
 	Voxel m_voxel;
 	Voxel m_surface;
 };
-
+Eigen::Vector3f Model::indexVecToCorrVec(Eigen::Vector3i& indexVec) {
+	Eigen::Vector3f temp;
+	temp[0] = m_corrX.index2coor(indexVec[0]);
+	temp[1] = m_corrY.index2coor(indexVec[1]);
+	temp[2] = m_corrZ.index2coor(indexVec[2]);
+	return temp;
+}
 Model::Model(int resX, int resY, int resZ)
 	: m_corrX(resX, -5, 5)
 	, m_corrY(resY, -10, 10)
@@ -96,6 +107,7 @@ Model::Model(int resX, int resY, int resZ)
 		m_neiborSize = 1;
 	m_voxel = Voxel(m_corrX.m_resolution, Pixel(m_corrY.m_resolution, std::vector<bool>(m_corrZ.m_resolution, true)));
 	m_surface = m_voxel;
+	Octree = new octree(resX-1, resY-1, resZ-1);
 }
 
 Model::~Model()
@@ -286,6 +298,127 @@ Eigen::Vector3f Model::getNormal(int indX, int indY, int indZ)
 		normalVector *= -1;
 	return normalVector;
 }
+void Model::updateNode(Node* node) {
+	PointSequenceInd pointsInd(8);
+	
+	Eigen::Vector3i temp;
+	for (int i = 0; i < 8; i++) {
+		if (i < 4) 
+			pointsInd[i][0] = node->xmin;
+		else pointsInd[i][0] = node->xmax;
+		if (i == 0 || i == 1 || i == 4 || i == 5) pointsInd[i][1] = node->ymin;
+		else pointsInd[i][1] = node->ymax;
+		if (i == 0 || i == 2 || i == 4 || i == 6) pointsInd[i][2] = node->zmin;
+		else pointsInd[i][2] = node->zmax;
+
+	}
+	bool allIn = true;
+	for (int j = 0; j < m_projectionList.size(); j++) {
+		bool allOut = false;
+		
+		for (int i = 0; i < 8; i++)
+		{
+			Eigen::Vector3f vec = indexVecToCorrVec(pointsInd[i]);
+			bool temp = m_projectionList[j].checkRange(vec[0], vec[1], vec[2]);
+			allOut = allOut||temp;
+			allIn = allIn&&temp;
+		}
+		if (!allOut) { node->status = Status::OUT; return; }
+		
+	}
+	if (allIn) {
+		node->status = Status::IN;
+		return;
+	}
+	else {
+		node->status = Status::ON;
+		return;
+	}
+}
+Status Model::searchPoint(int x, int y, int z, Node* p) {
+	if (p->children.size() == 0) return  p->status;
+	else {
+		if (x >= p->xmin&&x < p->getXmid())
+		{
+			if (y >= p->ymin&&y < p->getYmid()) {
+				if (z >= p->zmin&&z < p->getZmid()) {
+					return searchPoint(x, y, z, p->children[0]);
+				}
+				else {
+					return searchPoint(x, y, z, p->children[1]);
+				}
+			}
+			else {
+				if (z >= p->zmin&&z < p->getZmid()) {
+					return searchPoint(x, y, z, p->children[2]);
+				}
+				else {
+					return searchPoint(x, y, z, p->children[3]);
+				}
+			}
+		}
+		else {
+			if (y >= p->ymin&&y < p->getYmid()) {
+				if (z >= p->zmin&&z < p->getZmid()) {
+					return searchPoint(x, y, z, p->children[4]);
+				}
+				else {
+					return searchPoint(x, y, z, p->children[5]);
+				}
+			}
+			else {
+				if (z >= p->zmin&&z < p->getZmid()) {
+					return searchPoint(x, y, z, p->children[6]);
+				}
+				else {
+					return searchPoint(x, y, z, p->children[7]);
+				}
+			}
+		}
+	}
+}
+void Model::getModelUsingOctree() {
+	Octree->rootNode->status = Status::ON;
+	updateTree(Octree->rootNode);
+	for (int indexX = 0; indexX < m_corrX.m_resolution; indexX++)
+		for (int indexY = 0; indexY < m_corrY.m_resolution; indexY++)
+			for (int indexZ = 0; indexZ < m_corrZ.m_resolution; indexZ++) {
+				Status p = searchPoint(indexX, indexY, indexZ, Octree->rootNode);
+				if ( p== Status::OUT) {
+					m_voxel[indexX][indexY][indexZ] = 0;
+					m_surface[indexX][indexY][indexZ] = 0;
+				}
+				else {
+					if (p == Status::IN) {
+						m_surface[indexX][indexY][indexZ] = 0;
+					}
+				}
+			
+			}
+}
+
+void Model::updateTree(Node* node) {
+	if (node->status == Status::NONE) {
+		updateNode(node);
+	}
+		switch (node->status) {
+		case Status::IN:
+		case Status::OUT:
+			return;
+		case Status::ON:
+		{
+			int childnum=node->split();
+			if (!childnum) return;
+			else {
+				for (int k = 0; k < 8; k++)
+					updateTree(node->children[k]);
+			}
+		}
+		}
+	
+}
+
+
 
 int main(int argc, char** argv)
 {
@@ -306,6 +439,7 @@ int main(int argc, char** argv)
 
 	// 获得Voxel模型的表面
 	model.getSurface();
+	/*model.getModelUsingOctree();*/
 	std::cout << "get surface done\n";
 
 	// 将模型导出为xyz格式
